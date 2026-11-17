@@ -38,19 +38,20 @@ they are account-bound.
 ```bash
 git clone <this-repo> dsweb && cd dsweb
 ./scripts/setup.sh
-cp .env.example .env   # if setup didn't already
-# paste userToken from DevTools Local Storage
-./dsweb token
-./dsweb doctor
-./dsweb whoami
-./dsweb ask "hi"
+./dsweb token                 # → ~/.config/dsweb/auth.json
+./dsweb config set DS_API_KEY sk-your-local-key
+./dsweb doctor && ./dsweb whoami
+./dsweb serve                 # http://127.0.0.1:8787/v1
 ```
+
+OpenCode: provider `deepseek-local` → that base URL + same API key. Prefer a lean MCP set;
+huge tool catalogs (100+) make every turn slow because schemas are prompt-injected.
 
 ## Docs map
 
 | Doc | Contents |
 |-----|----------|
 | [architecture.md](./architecture.md) | How pieces fit (client, PoW, SSE, proxy, tools) |
-| [auth.md](./auth.md) | Token/cookie, XDG paths, `.env` |
+| [auth.md](./auth.md) | Token/cookie, XDG `auth.json` + `config.json` |
 | [proxy.md](./proxy.md) | OpenAI compat, thinking, tool emulation |
 | [cli.md](./cli.md) | Command cheat sheet |

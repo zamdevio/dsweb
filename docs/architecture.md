@@ -7,11 +7,13 @@ Agent/dev map — enough to navigate without reading every file.
 ```
 dsweb                 CLI entry (bash)
 scripts/              setup.sh · selftest.sh
-.env / .env.example   portable config (gitignored secrets)
+~/.config/dsweb/      auth.json (secrets) · config.json (settings)
 lib/client/           Python upstream client
-  api.py              DeepSeekClient: whoami, session, stream, chat
-  tools.py            OpenAI tools prompt-inject + <tool_call> parse
+  api.py              DeepSeekClient: whoami, temp sessions, stream, chat
+  tools.py            <tool_call> + DSML (fullwidth ｜) → OpenAI tool_calls
   sse.py / pow.py / http.py / config.py
+lib/xdg_config.py     config.json load/set
+lib/json.sh           jq-optional JSON helpers
 lib/style/unix.sh     TTY ANSI + banners
 lib/                  proxy, dshttp, wasm, bash helpers
 core/                 bash: auth, session, chat

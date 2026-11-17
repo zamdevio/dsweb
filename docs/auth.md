@@ -1,46 +1,35 @@
-# Auth
+# Auth & config
 
-## Required credential
+## Clear rules
 
-| Method | Reliability | Notes |
-|--------|-------------|-------|
-| `userToken` (localStorage) | **Best** | `./dsweb token` |
-| Full `Cookie` header | Good | Must include extractable `userToken` |
-| Email + password | Poor | Often empty `202` from AWS WAF |
+| What | Where | How |
+|------|--------|-----|
+| **Secrets** (`userToken`, cookie) | `~/.config/dsweb/auth.json` | `./dsweb token` / `cookie` / `login` |
+| **Settings** (port, API key, model, …) | `~/.config/dsweb/config.json` | `./dsweb config` |
+| **One-shot overrides** | process env (`DS_TOKEN=… ./dsweb …`) | wins over files |
+| **Repo `.env`** | legacy only | settings OK; **secrets ignored** (setup migrates them) |
 
-### Getting `userToken`
+Never put `DS_TOKEN` in `.env` or `config.json`. That conflict is what caused stale/invalid auth.
 
-1. Log into https://chat.deepseek.com in a browser  
-2. DevTools → **Application** → **Local Storage** → `https://chat.deepseek.com`  
-3. Copy `userToken` (raw string or `{"value":"...","__version":"0"}`)  
-4. `./dsweb token '<paste>'`
+## Getting `userToken`
 
-## Where it lives
-
-| Item | Default path |
-|------|----------------|
-| Auth JSON | `~/.config/dsweb/auth.json` |
-| Cookie jar | `~/.local/share/dsweb/cookies.jar` |
-| Cache | `~/.local/share/dsweb/cache/` |
-
-Override with `DS_CONFIG_DIR` / `DS_DATA_DIR` / `DS_AUTH_FILE` in `.env`.
-
-`.env` may also set `DS_TOKEN` / `DS_COOKIE` directly (useful for CI). Process
-environment wins over `.env` file values.
+1. Log into https://chat.deepseek.com  
+2. DevTools → **Application** → **Local Storage** → `userToken`  
+3. `./dsweb token` and paste  
 
 ## Commands
 
 ```bash
-./dsweb token          # save + verify
-./dsweb whoami         # full profile (token redacted in dump)
-./dsweb logout         # delete auth.json
-./dsweb doctor         # fails non-zero if auth invalid
+./dsweb token                 # save → auth.json + verify
+./dsweb whoami                # profile (works without jq)
+./dsweb logout                # delete auth.json
+./dsweb config                # show config.json
+./dsweb config set DS_API_KEY sk-mykey
+./dsweb config get DS_PORT
+./dsweb doctor                # paths + auth validity
 ```
 
-## New machine
+## jq
 
-1. `./scripts/setup.sh`  
-2. Copy `.env` **without** secrets, or start from `.env.example`  
-3. Paste a fresh `userToken` (or copy `auth.json` yourself securely)  
-
-There is no automatic cloud sync of credentials by design.
+Optional. `setup` can install it; otherwise Python JSON helpers are used for
+token / whoami / sessions / PoW. Doctor treats missing jq as OK.

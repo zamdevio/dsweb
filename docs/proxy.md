@@ -7,7 +7,8 @@
 ```
 
 Auth to the **local** proxy uses `Authorization: Bearer $DS_API_KEY`
-(not your DeepSeek userToken). Upstream auth is loaded from XDG / `.env`.
+(not your DeepSeek userToken). Set via `./dsweb config set DS_API_KEY …`.
+Upstream userToken lives in `~/.config/dsweb/auth.json`.
 
 ## Endpoints
 
@@ -29,15 +30,13 @@ Auth to the **local** proxy uses `Authorization: Bearer $DS_API_KEY`
 Web upstream ≠ official Tools API. When the request includes `tools`:
 
 1. Schemas are injected into the prompt  
-2. Model is instructed to emit `<tool_call>{"name","arguments"}</tool_call>`  
-3. Proxy parses → OpenAI `tool_calls` + `finish_reason: "tool_calls"`  
-4. Agent sends `role: "tool"` results; proxy folds them into the next prompt  
+2. Model should emit `<tool_call>{"name","arguments"}</tool_call>`  
+3. Native DeepSeek DSML (`<｜DSML｜ invoke>…`) is also parsed/stripped  
+4. Proxy returns OpenAI `tool_calls` + `finish_reason: "tool_calls"`  
+5. Agent sends `role: "tool"` results; proxy folds them into the next prompt  
 
-Streaming with tools **buffers** content until the end so tool_calls can be
-emitted cleanly.
-
-Limits: model may ignore the format; multi-tool / exotic `tool_choice` is
-best-effort.
+Streaming with tools **buffers** until the end so tool_calls emit cleanly.
+Keep MCP tool catalogs lean — every schema is prompt-injected each turn.
 
 ## Search
 
