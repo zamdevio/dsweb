@@ -29,8 +29,9 @@ ROOT = LIB.parent
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from client import DeepSeekClient, UpstreamError  # noqa: E402
+from client import AuthError, DeepSeekClient, UpstreamError  # noqa: E402
 from client.tools import (  # noqa: E402
+    contains_tool_markup,
     messages_to_prompt,
     parse_tool_calls,
     strip_tool_blocks,
@@ -136,6 +137,9 @@ async def _count_requests(request: Request, call_next):
                 kind = ""
         if not quiet:
             extra = kind
+            tools_n = getattr(request.state, "ds_tools", None)
+            if tools_n is not None:
+                extra = f"{extra} tools={tools_n}".strip()
             _log_req(n, request.method, path, status, ms, extra)
 
 
@@ -233,7 +237,7 @@ async def chat_completions(
     mapped = _map_model(body.get("model"))
     thinking = bool(body.get("thinking", mapped["thinking"]))
     search = bool(body.get("search", body.get("web_search", False)))
-
+    request.state.ds_tools = len(tools)
     created = int(time.time())
     cmpl_id = _new_id()
     model_name = body.get("model") or DEFAULT_MODEL
@@ -246,16 +250,22 @@ async def chat_completions(
         except UpstreamError as exc:
             raise HTTPException(502, str(exc)) from exc
 
-        tool_calls = parse_tool_calls(content) if tools else []
+        tool_calls = parse_tool_calls(content)
+        clean = strip_tool_blocks(content)
+        if contains_tool_markup(clean):
+            clean = strip_tool_blocks(clean)
         if tool_calls:
             msg = {
                 "role": "assistant",
-                "content": strip_tool_blocks(content) or None,
+                "content": clean or None,
                 "tool_calls": tool_calls,
             }
             finish = "tool_calls"
         else:
-            msg = {"role": "assistant", "content": content}
+            msg = {"role": "assistant", "content": clean if clean else content}
+            # If markup was stripped to empty, don't re-leak the raw body.
+            if contains_tool_markup(content) and not clean:
+                msg["content"] = None
             finish = "stop"
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -277,7 +287,8 @@ async def chat_completions(
             },
         })
 
-    # Streaming: buffer content when tools are enabled so we can emit tool_calls.
+    # Streaming: buffer when tools are on, or when the model slips into DSML /
+    # <tool_call> so we never leak wire format as assistant text.
     def event_stream():
         yield _chunk({
             "id": cmpl_id,
@@ -291,6 +302,9 @@ async def chat_completions(
             }],
         })
         buf_content: list[str] = []
+        # Always buffer when tools are declared; also flip on mid-stream if the
+        # model slips into DSML (fullwidth ｜ or ASCII) / <tool_call>.
+        buffering = bool(tools)
         try:
             for kind, text in _client.stream(
                 prompt, thinking=thinking, search=search
@@ -308,7 +322,9 @@ async def chat_completions(
                         }],
                     })
                     continue
-                if tools:
+                if not buffering and contains_tool_markup(text):
+                    buffering = True
+                if buffering:
                     buf_content.append(text)
                     continue
                 yield _chunk({
@@ -322,7 +338,8 @@ async def chat_completions(
                         "finish_reason": None,
                     }],
                 })
-        except UpstreamError as exc:
+        except Exception as exc:
+            # PoW traps / network blips must not tear down the ASGI worker.
             yield _chunk({
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
@@ -338,12 +355,15 @@ async def chat_completions(
             return
 
         finish = "stop"
-        if tools:
+        if buf_content:
             full = "".join(buf_content)
             tool_calls = parse_tool_calls(full)
+            leftover = strip_tool_blocks(full)
+            # Never forward raw DSML / tool markup as assistant text.
+            if contains_tool_markup(leftover):
+                leftover = strip_tool_blocks(leftover)
             if tool_calls:
                 finish = "tool_calls"
-                # OpenAI streaming tool_calls: role already sent; emit tool_call deltas
                 for i, tc in enumerate(tool_calls):
                     yield _chunk({
                         "id": cmpl_id,
@@ -366,32 +386,18 @@ async def chat_completions(
                             "finish_reason": None,
                         }],
                     })
-                leftover = strip_tool_blocks(full)
-                if leftover:
-                    yield _chunk({
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": leftover},
-                            "finish_reason": None,
-                        }],
-                    })
-            else:
-                if full:
-                    yield _chunk({
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": full},
-                            "finish_reason": None,
-                        }],
-                    })
+            if leftover:
+                yield _chunk({
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": leftover},
+                        "finish_reason": None,
+                    }],
+                })
 
         yield _chunk({
             "id": cmpl_id,
@@ -471,13 +477,20 @@ async def anthropic_messages(
             "index": 0,
             "content_block": {"type": "text", "text": ""},
         })
-        for kind, text in _client.stream(prompt, thinking=mapped["thinking"]):
-            if kind != "content":
-                continue
+        try:
+            for kind, text in _client.stream(prompt, thinking=mapped["thinking"]):
+                if kind != "content":
+                    continue
+                yield ev({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+        except Exception as exc:
             yield ev({
                 "type": "content_block_delta",
                 "index": 0,
-                "delta": {"type": "text_delta", "text": text},
+                "delta": {"type": "text_delta", "text": f"\n[error: {exc}]"},
             })
         yield ev({"type": "content_block_stop", "index": 0})
         yield ev({
@@ -506,6 +519,19 @@ def _banner():
         f"  {_c(dim, 'model')}    {DEFAULT_MODEL}",
         f"  {_c(dim, 'tools')}    prompt-emulated",
         f"  {_c(dim, 'key')}      {'set' if DS_API_KEY else 'missing'}",
+    ]
+    # Fail loud on dead token at boot — beats 5× pow retries mid-chat.
+    auth_line = f"  {_c(dim, 'auth')}     not checked"
+    try:
+        biz = _client.whoami()
+        name = biz.get("user_name") or biz.get("email") or biz.get("id") or "ok"
+        auth_line = f"  {_c(dim, 'auth')}     ok ({name})"
+    except AuthError as exc:
+        auth_line = f"  {_c('31;1', 'auth')}     INVALID — {exc}"
+    except Exception as exc:
+        auth_line = f"  {_c('33;1', 'auth')}     warn: {exc}"
+    lines.append(auth_line)
+    lines += [
         _c(dim, "─" * 44),
         f"  {_c(dim, 'requests log below · Ctrl-C to stop')}",
         "",

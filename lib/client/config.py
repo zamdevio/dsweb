@@ -1,13 +1,29 @@
-"""Env-backed config. Portable — no machine-specific hardcoded paths."""
+"""Env-backed config. Portable — no machine-specific hardcoded paths.
+
+Settings: process env > ~/.config/dsweb/config.json > defaults.
+Secrets:  process env DS_TOKEN/DS_COOKIE > ~/.config/dsweb/auth.json.
+Never reads secrets from .env / config.json.
+"""
 from __future__ import annotations
 
 import json
 import os
 import pathlib
+import sys
 
 # lib/client/config.py → repo root is parents[2], lib/ is parents[1]
 LIB = pathlib.Path(__file__).resolve().parent.parent
 ROOT = LIB.parent
+
+# Apply XDG config.json before reading settings (skips secrets).
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+try:
+    from xdg_config import apply_config_to_env  # type: ignore
+
+    apply_config_to_env()
+except Exception:
+    pass
 
 
 def _xdg_config() -> pathlib.Path:
@@ -56,12 +72,42 @@ def _auth_file() -> dict:
 
 
 def token() -> str:
-    return os.environ.get("DS_TOKEN") or _auth_file().get("token") or ""
+    # Explicit process env only — empty string in env must not block auth.json.
+    env = os.environ.get("DS_TOKEN")
+    if env:
+        return env
+    return _auth_file().get("token") or ""
 
 
 def cookie() -> str:
-    return os.environ.get("DS_COOKIE") or _auth_file().get("cookie") or ""
+    env = os.environ.get("DS_COOKIE")
+    if env:
+        return env
+    return _auth_file().get("cookie") or ""
 
 
 TOKEN = token()
 COOKIE = cookie()
+
+
+def _truthy(name: str, default: str) -> bool:
+    v = (os.environ.get(name) or default).lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def save_chats() -> bool:
+    """Opt-in: keep upstream chat_session rows on chat.deepseek.com.
+
+    Default is false (temp/throwaway) so the official sidebar stays clean.
+    Set DS_SAVE_CHATS=true to persist. Legacy DS_TEMP_SESSIONS=false also
+    enables saving.
+    """
+    if "DS_SAVE_CHATS" in os.environ:
+        return _truthy("DS_SAVE_CHATS", "false")
+    # legacy: DS_TEMP_SESSIONS=true → don't save
+    return not _truthy("DS_TEMP_SESSIONS", "true")
+
+
+def temp_sessions() -> bool:
+    """Inverse of save_chats() — kept for older call sites."""
+    return not save_chats()

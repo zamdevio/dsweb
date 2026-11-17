@@ -17,7 +17,7 @@ check() {
 
 # 1. PoW
 chal='{"algorithm":"DeepSeekHashV1","challenge":"b0000b22959bad0cc1ecbbfa07f97191b20332fa10d7341ff9c7ba6e7ed927f1","salt":"dde3ed472be5a2494ee0","difficulty":144000,"expire_at":1777057596443,"signature":"test","target_path":"/api/v0/chat/completion"}'
-answer="$(printf '%s' "$chal" | "$DS_PYTHON" "$ROOT/lib/pow.py" | base64 -d | jq -r '.answer')"
+answer="$(printf '%s' "$chal" | "$DS_PYTHON" "$ROOT/lib/pow.py" | "$DS_PYTHON" -c 'import sys,json,base64; print(json.loads(base64.b64decode(sys.stdin.read())).get("answer",""))')"
 check "pow solves challenge" "58033" "$answer"
 
 # 2. SSE
@@ -70,11 +70,33 @@ text = 'sure\n<tool_call>\n{"name":"get_weather","arguments":{"city":"SF"}}\n</t
 calls = parse_tool_calls(text)
 assert len(calls) == 1 and calls[0]["function"]["name"] == "get_weather"
 assert strip_tool_blocks(text) == "sure"
+dsml = '''<|DSML|invoke name="web_search">
+<|DSML|parameter name="query" string="true">dsweb</|DSML|parameter>
+</|DSML|invoke>'''
+dcalls = parse_tool_calls(dsml)
+assert len(dcalls) == 1 and dcalls[0]["function"]["name"] == "web_search"
+assert "dsweb" in dcalls[0]["function"]["arguments"]
+assert "DSML" not in strip_tool_blocks("faint " + dsml)
+# Real DeepSeek wire format uses fullwidth ｜ (U+FF5C) + spaced tag names
+fw = (
+    'Let me check.\n'
+    '<\uff5cDSML\uff5c calls>\n'
+    '<\uff5cDSML\uff5c invoke name="execute">\n'
+    '<\uff5cDSML\uff5c parameter name="code" string="true">console.log(1)</\uff5cDSML\uff5c parameter>\n'
+    '</\uff5cDSML\uff5c invoke>\n'
+    '</\uff5cDSML\uff5c calls>'
+)
+fwc = parse_tool_calls(fw)
+assert len(fwc) == 1 and fwc[0]["function"]["name"] == "execute", fwc
+assert "console.log" in fwc[0]["function"]["arguments"]
+assert "DSML" not in strip_tool_blocks(fw)
+assert strip_tool_blocks(fw) == "Let me check."
 prompt = messages_to_prompt(
     [{"role":"user","content":"hi"}],
     tools=[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
 )
 assert "get_weather" in prompt and "<tool_call>" in prompt
+assert "Never use DSML" in prompt
 assert DeepSeekClient is not None
 PY
 then log_ok "PASS: client + tools"; pass=$((pass+1))
