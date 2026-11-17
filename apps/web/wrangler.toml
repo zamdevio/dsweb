@@ -1,0 +1,4 @@
+# Cloudflare Pages — https://thedsweb.pages.dev/
+name = "thedsweb"
+compatibility_date = "2025-11-01"
+pages_build_output_dir = "dist"

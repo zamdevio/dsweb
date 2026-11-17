@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# dsweb — unofficial chat.deepseek.com CLI + local OpenAI-compatible proxy.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SELF_DIR/lib/config.sh"
+source "$SELF_DIR/lib/log.sh"
+source "$SELF_DIR/lib/http.sh"
+source "$SELF_DIR/core/auth.sh"
+source "$SELF_DIR/core/session.sh"
+source "$SELF_DIR/core/chat.sh"
+
+usage() {
+  printf '%s%s%s — unofficial DeepSeek web client + local OpenAI proxy\n' \
+    "$_S_MINT$_S_BOLD" "dsweb" "$_S_RST"
+  printf '%sNot affiliated with DeepSeek. See docs/overview.md · LICENSE.%s\n' \
+    "$_S_DIM" "$_S_RST"
+
+  ds_help_h "USAGE"
+  printf '  %s\n' "./dsweb <command> [flags]"
+
+  ds_help_h "AUTH"
+  ds_help_line "token [TOKEN|-]" "save userToken (Local Storage)"
+  ds_help_line "cookie [COOKIE|-]" "save Cookie header"
+  ds_help_line "login [email] [pw]" "password login (often WAF-blocked)"
+  ds_help_line "whoami" "styled profile for current auth"
+  ds_help_line "logout" "remove saved auth"
+
+  ds_help_h "CHAT"
+  ds_help_line "ask \"…\"" "one-shot completion"
+  ds_help_line "chat" "interactive REPL"
+  ds_help_line "-s, --session <id>" "reuse a session"
+  ds_help_line "--think / --search" "enable thinking / web search"
+  ds_help_line "--model <m>" "deepseek-chat | deepseek-reasoner"
+
+  ds_help_h "SESSIONS"
+  ds_help_line "sessions" "list upstream sessions"
+  ds_help_line "rm <id>" "delete a session"
+
+  ds_help_h "PROXY"
+  ds_help_line "serve [--port N]" "OpenAI-compatible server + request log"
+  ds_help_line "cloudflared [--raw]" "tunnel; hides noise, prints public URL"
+  ds_help_line "url" "print base url + samples"
+
+  ds_help_h "SETUP"
+  ds_help_line "setup" "idempotent bootstrap"
+  ds_help_line "selftest" "offline checks"
+  ds_help_line "doctor" "deps / auth / paths"
+
+  ds_help_h "FLAGS"
+  ds_help_line "--no-color" "plain output (or DS_COLOR=never)"
+  ds_help_line "--raw" "with cloudflared: show tunnel logs"
+
+  ds_help_h "EXAMPLES"
+  printf '  %s\n' \
+    "./scripts/setup.sh" \
+    "./dsweb token" \
+    "./dsweb whoami" \
+    "./dsweb ask \"hi\" --think" \
+    "./dsweb serve" \
+    "./dsweb cloudflared"
+  printf '\n'
+}
+
+need_auth() { ds_auth_ensure; }
+load_or_die() { ds_auth_ensure; }
+
+cmd_login() {
+  local email="${1:-}" password="${2:-}"
+  [[ -z "$email" ]] && read -r -p "email: " email
+  if [[ -z "$password" ]]; then read -r -s -p "password: " password; echo; fi
+  ds_auth_login "$email" "$password"
+}
+
+cmd_cookie() {
+  local arg="${1:-}"
+  if [[ -z "$arg" ]]; then log_info "paste cookie, Ctrl-D:"; ds_auth_from_cookie "$(cat)"
+  elif [[ "$arg" == "-" ]]; then ds_auth_from_cookie "$(cat)"
+  else ds_auth_from_cookie "$arg"; fi
+  if ds_auth_verify; then log_ok "auth ok (run: whoami)"; else log_warn "saved but verify failed"; fi
+}
+
+cmd_token() {
+  local tok="${1:-}"
+  if [[ -z "$tok" ]]; then log_info "paste token, Ctrl-D:"; tok="$(cat)"; fi
+  ds_auth_set_token "$tok"
+  if ds_auth_verify; then log_ok "auth ok (run: whoami)"; else log_warn "saved but verify failed"; fi
+}
+
+cmd_ask() {
+  local prompt="$1" sid="${DS_SESSION_ID:-}"
+  need_auth
+  [[ -z "$sid" ]] && sid="$(ds_session_new)"
+  ds_chat_stream "$sid" "$prompt" || die "request failed"
+}
+
+cmd_chat() {
+  need_auth
+  local sid="${DS_SESSION_ID:-}"
+  [[ -z "$sid" ]] && sid="$(ds_session_new)"
+  log_ok "interactive session $sid (Ctrl-D to quit)"
+  while printf 'you> ' && IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    printf 'ai>  '
+    ds_chat_stream "$sid" "$line" || log_warn "request failed"
+  done
+}
+
+cmd_setup() {
+  exec "$DS_ROOT/scripts/setup.sh"
+}
+
+cmd_doctor() {
+  local failures=0
+  say_ok() { log_ok "$*"; }
+  say_bad() { log_err "$*"; failures=$((failures + 1)); }
+  say_warn() { log_warn "$*"; }
+
+  log_info "dsweb doctor"
+  echo "  root:    $DS_ROOT"
+  echo "  config:  $DS_CONFIG_DIR"
+  echo "  data:    $DS_DATA_DIR"
+  echo "  auth:    $DS_AUTH_FILE"
+  echo "  python:  $DS_PYTHON"
+  echo "  upstream:$DS_BASE_URL"
+  echo "  proxy:   http://$DS_HOST:$DS_PORT"
+  echo
+
+  [[ -f "$DS_ROOT/.env" ]] && say_ok ".env present" || say_warn ".env missing (cp .env.example .env)"
+
+  if [[ -x "$DS_ROOT/.venv/bin/python" ]]; then say_ok "venv present"
+  else say_bad "venv missing — run: ./dsweb setup"; fi
+
+  if "$DS_PYTHON" -c 'import curl_cffi, wasmtime, fastapi, uvicorn' 2>/dev/null; then
+    say_ok "python deps import ok"
+  else
+    say_bad "python deps missing — run: ./dsweb setup"
+  fi
+
+  if "$DS_PYTHON" -c 'import sys; sys.path.insert(0,"lib"); from client import DeepSeekClient' 2>/dev/null; then
+    say_ok "client package import ok"
+  else
+    say_bad "client package import failed"
+  fi
+
+  command -v jq >/dev/null && say_ok "jq present" || say_bad "jq missing"
+  command -v curl >/dev/null && say_ok "curl present" || say_bad "curl missing"
+  [[ -f "$DS_WASM" ]] && say_ok "pow wasm present" || say_bad "pow wasm missing at $DS_WASM"
+
+  if ds_api_key_is_weak; then
+    say_warn "DS_API_KEY is weak/default — fine for localhost; required strong for cloudflared"
+  else
+    say_ok "DS_API_KEY looks set"
+  fi
+
+  if [[ -n "${DS_TOKEN:-}" || -f "$DS_AUTH_FILE" ]]; then
+    say_ok "auth credential present"
+    if ds_auth_load 2>/dev/null && ds_auth_verify; then
+      say_ok "auth valid (whoami reachable)"
+    else
+      say_bad "auth present but invalid — ./dsweb token"
+    fi
+  else
+    say_warn "no auth — ./dsweb token <userToken>"
+  fi
+
+  echo
+  if [[ $failures -eq 0 ]]; then
+    log_ok "doctor: all critical checks passed"
+    return 0
+  fi
+  log_err "doctor: $failures critical issue(s)"
+  return 1
+}
+
+cmd_serve() {
+  need_auth
+  if ! ds_auth_verify; then
+    die "auth invalid — fix with ./dsweb token before serve"
+  fi
+  local port="$DS_PORT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  DS_PORT="$port" exec "$DS_PYTHON" "$DS_ROOT/lib/proxy.py"
+}
+
+cmd_url() {
+  echo "base url : http://$DS_HOST:$DS_PORT/v1"
+  echo "api key  : $DS_API_KEY"
+  echo
+  echo "OpenAI SDK:"
+  echo "  base_url='http://$DS_HOST:$DS_PORT/v1'  api_key='$DS_API_KEY'"
+  echo "curl:"
+  echo "  curl http://$DS_HOST:$DS_PORT/v1/chat/completions \\"
+  echo "    -H 'Authorization: Bearer $DS_API_KEY' -H 'Content-Type: application/json' \\"
+  echo "    -d '{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
+}
+
+# True if something already answers on the proxy health endpoint.
+ds_proxy_up() {
+  local port="${1:-$DS_PORT}"
+  curl -sf -o /dev/null --connect-timeout 1 "http://127.0.0.1:${port}/health" 2>/dev/null
+}
+
+# Filter cloudflared stdout/stderr: keep URL, hide the rest (unless --raw).
+ds_cloudflared_filter() {
+  local raw="${1:-0}" url_shown=0
+  local line url
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$raw" == "1" ]]; then
+      printf '%s%s%s\n' "$_S_DIM" "$line" "$_S_RST" >&2
+      continue
+    fi
+    # Extract first trycloudflare quick-tunnel URL
+    if [[ "$url_shown" -eq 0 ]]; then
+      url="$(printf '%s' "$line" | grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -1 || true)"
+      if [[ -n "$url" ]]; then
+        url_shown=1
+        ds_banner "dsweb tunnel ready" \
+          "$(printf '%s%-10s%s %s' "$_S_DIM" "public" "$_S_RST" "$(ds_mint "$url")")" \
+          "$(printf '%s%-10s%s %s/v1' "$_S_DIM" "openai" "$_S_RST" "$(ds_mint "$url")")" \
+          "$(printf '%s%-10s%s Bearer %s' "$_S_DIM" "auth" "$_S_RST" "$DS_API_KEY")" \
+          "$(printf '%s%-10s%s proxy request log continues below' "$_S_DIM" "hint" "$_S_RST")"
+      fi
+    fi
+    # Swallow cloudflared chatter (errors about origin still useful if raw)
+  done
+}
+
+cmd_cloudflared() {
+  local port="$DS_PORT" raw="${DS_RAW:-0}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --raw) raw=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  if ds_api_key_is_weak; then
+    die "refusing cloudflared: set a strong DS_API_KEY in .env (public tunnel would be open)"
+  fi
+  if ! command -v cloudflared >/dev/null; then
+    if ds_bool "${DS_CLOUDFLARED_AUTOINSTALL:-true}"; then
+      cmd_install_cloudflared || die "cloudflared install failed"
+    else
+      die "cloudflared not installed"
+    fi
+  fi
+
+  local started_proxy=0 proxy_pid=""
+  cleanup_tunnel() {
+    if [[ "$started_proxy" -eq 1 && -n "$proxy_pid" ]]; then
+      log_info "stopping local proxy (pid $proxy_pid)"
+      kill "$proxy_pid" 2>/dev/null || true
+      wait "$proxy_pid" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_tunnel EXIT INT TERM
+
+  if ds_proxy_up "$port"; then
+    log_ok "proxy already up on :$port"
+  else
+    need_auth
+    ds_auth_verify || die "auth invalid — ./dsweb token before cloudflared"
+    log_info "starting local proxy on :$port"
+    # Proxy logs stay on this TTY (request counters). cloudflared noise is filtered.
+    DS_HOST=127.0.0.1 DS_PORT="$port" "$DS_PYTHON" "$DS_ROOT/lib/proxy.py" &
+    proxy_pid=$!
+    started_proxy=1
+    local i
+    for i in $(seq 1 40); do
+      if ds_proxy_up "$port"; then
+        log_ok "proxy ready (pid $proxy_pid)"
+        break
+      fi
+      if ! kill -0 "$proxy_pid" 2>/dev/null; then
+        die "proxy exited before becoming ready"
+      fi
+      sleep 0.25
+    done
+    ds_proxy_up "$port" || die "proxy did not become ready on :$port"
+  fi
+
+  log_info "opening trycloudflare tunnel (cloudflared logs hidden$([[ "$raw" == 1 ]] && echo ' · --raw' || true))"
+  # Filter cloudflared; proxy keeps printing request lines on the same terminal.
+  set +e
+  cloudflared tunnel --url "http://127.0.0.1:$port" --no-autoupdate 2>&1 \
+    | ds_cloudflared_filter "$raw"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  return "$rc"
+}
+
+cmd_install_cloudflared() {
+  local arch dst
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) log_warn "unknown arch $arch; trying amd64"; arch="amd64" ;;
+  esac
+  dst="$DS_DATA_DIR/bin"
+  mkdir -p "$dst"
+  log_info "downloading cloudflared ($arch) ..."
+  local url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"
+  if curl -fsSL "$url" -o "$dst/cloudflared"; then
+    chmod +x "$dst/cloudflared"
+    export PATH="$dst:$PATH"
+    [[ -w /usr/local/bin ]] && ln -sf "$dst/cloudflared" /usr/local/bin/cloudflared 2>/dev/null || true
+    log_ok "installed to $dst/cloudflared"
+    return 0
+  fi
+  log_err "download failed"
+  return 1
+}
+
+# Pull leading global flags so `./dsweb --no-color doctor` works.
+ds_parse_globals() {
+  DS_SESSION_ID="${DS_SESSION_ID:-}"
+  DS_RAW="${DS_RAW:-0}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--session) DS_SESSION_ID="$2"; shift 2 ;;
+      --think)      DS_THINKING=1; shift ;;
+      --search)     DS_SEARCH=1; shift ;;
+      --model)      DS_MODEL="$2"; shift 2 ;;
+      --port)       DS_PORT="$2"; shift 2 ;;
+      --raw)        DS_RAW=1; shift ;;
+      --no-color)   DS_COLOR=never; shift ;;
+      -h|--help)    printf '%s\n' "help"; return 0 ;;
+      *) break ;;
+    esac
+  done
+  DS_ARGV=("$@")
+}
+
+main() {
+  ds_ensure_dirs
+  local -a DS_ARGV=()
+  ds_parse_globals "$@"
+  set -- "${DS_ARGV[@]}"
+
+  local cmd="${1:-}"; shift || true
+  # Flags may also appear after the command name.
+  ds_parse_globals "$@"
+  set -- "${DS_ARGV[@]}"
+
+  export DS_SESSION_ID DS_THINKING DS_SEARCH DS_MODEL DS_PORT DS_RAW DS_COLOR
+  ds_style_init
+
+  case "$cmd" in
+    login)    cmd_login "$@" ;;
+    cookie)   cmd_cookie "$@" ;;
+    token)    cmd_token "$@" ;;
+    whoami|status) load_or_die; ds_auth_whoami ;;
+    logout)   ds_auth_logout ;;
+    ask)      cmd_ask "$*" ;;
+    chat)     cmd_chat ;;
+    sessions) need_auth; ds_session_list ;;
+    rm)       need_auth; ds_session_delete "$1" ;;
+    serve)    cmd_serve "$@" ;;
+    cloudflared|tunnel) cmd_cloudflared "$@" ;;
+    url)      cmd_url ;;
+    setup)    cmd_setup ;;
+    doctor)   cmd_doctor ;;
+    selftest) exec "$DS_ROOT/scripts/selftest.sh" ;;
+    ""|help)  usage ;;
+    *) log_err "unknown command: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"

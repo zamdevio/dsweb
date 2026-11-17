@@ -1,0 +1,21 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+data/
+*.egg-info/
+dist/
+build/
+node_modules/
+.wrangler/
+apps/web/dist/
+
+# local auth / jars if ever copied into the tree
+config/auth.json
+auth.json
+cookies.jar
+
+# maintainer scratch (keep folder via .gitkeep)
+maintainer/temp/*
+!maintainer/temp/.gitkeep
