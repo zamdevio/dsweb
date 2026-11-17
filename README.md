@@ -23,9 +23,15 @@
 
 ---
 
+> **Warning — do not use your primary DeepSeek account.**  
+> dsweb talks to **chat.deepseek.com** like a browser, not the official Platform
+> API. DeepSeek’s risk control regularly **suspends accounts** used this way
+> (temporary policy locks are common). Use a disposable / secondary account only,
+> or use [`api.deepseek.com`](https://platform.deepseek.com) for anything you care about.  
+> Details: [docs/overview.md § Risk](./docs/overview.md#legal--risk-read-this).
+
 **Not affiliated with DeepSeek.** This reverse-engineers the public web app
-(WAF, PoW, SSE). It can break when they change anything. Official API users
-should use `api.deepseek.com` instead.
+(WAF, PoW, SSE). It can break when they change anything.
 
 | Surface | Role |
 |---------|------|
@@ -84,11 +90,16 @@ print(c.chat.completions.create(
 Tool calls are **prompt-emulated** (web has no native tools API) but return
 real OpenAI-shaped `tool_calls` for agent loops. Details: [docs/proxy.md](./docs/proxy.md).
 
-## Legal
+## Legal / account risk
 
-- **Unofficial.** May violate DeepSeek ToS; use at your own risk.
-- **No warranty.** MIT — see [LICENSE](./LICENSE).
-- **Don't commit secrets.** `.env` and `auth.json` stay local.
+- **Unofficial.** Likely violates DeepSeek ToS; **account suspension is expected**,
+  not a bug. Prefer a throwaway login — never your main / paid / work account.
+- **Detection (high level).** Automated clients stand out vs a normal browser:
+  high request rate, many parallel completions, PoW + session churn, non-browser
+  TLS/JA3 fingerprints, agent/tool prompt shapes. DeepSeek can revoke `userToken`
+  quickly and issue temporary policy suspensions.
+- **No warranty.** MIT — see [LICENSE](./LICENSE). Authors are not liable for bans.
+- **Don't commit secrets.** `auth.json` / `.env` stay local.
 - **Public tunnels:** `cloudflared` requires a non-default `DS_API_KEY`.
 
 ## Maintainer

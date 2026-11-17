@@ -21,12 +21,28 @@ A **userToken** (or cookie) from a logged-in browser session. Password login is
 best-effort and often blocked by AWS WAF. There is no way around credentials —
 they are account-bound.
 
+**Use a secondary / disposable DeepSeek account.** Do not paste a token from the
+account you rely on for chat, billing, or work. Suspensions of the form
+*“violation of user policies… suspended until <date>”* are returned by
+DeepSeek upstream and are outside this tool’s control.
+
 ## Legal / risk (read this)
 
 - **Unofficial / reverse-engineered.** Endpoints, payloads, PoW, and WAF rules
   can change without notice and will break this tool.
-- **Terms of Service.** Using automation against chat.deepseek.com may violate
-  DeepSeek’s ToS. You use this software **at your own risk**.
+- **Terms of Service.** Automating chat.deepseek.com may violate DeepSeek’s ToS.
+  You use this software **at your own risk**.
+- **Account suspension.** DeepSeek’s risk control can invalidate `userToken`
+  within minutes under load and lock the account for days. Prefer the official
+  Platform API (`api.deepseek.com`) for reliability.
+- **How detection tends to work (informational).** Signals are the usual
+  anti-abuse ones — not magic:
+  - volume / burstiness (many completions in parallel, agent tool loops)
+  - session patterns (rapid `chat_session` create/delete, no real browser UI)
+  - client fingerprint (curl_cffi / non-browser stacks still differ from Chrome)
+  - PoW + API shape used outside the official web/app clients  
+  There is no supported “stealth mode.” Rate limits and secondary accounts only
+  reduce chance; they do not make this ToS-safe.
 - **No warranty.** See [LICENSE](../LICENSE) (MIT). Authors are not liable for
   account bans, data loss, or downstream damage.
 - **Secrets.** Never commit `.env` or `auth.json`. Rotate tokens if exposed.

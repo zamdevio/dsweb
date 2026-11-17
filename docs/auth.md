@@ -13,7 +13,10 @@ Never put `DS_TOKEN` in `.env` or `config.json`. That conflict is what caused st
 
 ## Getting `userToken`
 
-1. Log into https://chat.deepseek.com  
+**Secondary account only** — see [overview risk notes](./overview.md#legal--risk-read-this).
+Primary-account bans from unofficial clients are common.
+
+1. Log into https://chat.deepseek.com (throwaway login recommended)  
 2. DevTools → **Application** → **Local Storage** → `userToken`  
 3. `./dsweb token` and paste  
 
