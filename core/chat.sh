@@ -24,19 +24,19 @@ ds_chat_stream() {
   local think="false" search="false"
   [[ -n "${DS_THINKING:-}" ]] && think="true"
   [[ -n "${DS_SEARCH:-}" ]] && search="true"
-  payload="$(jq -n \
-    --arg sid "$session_id" \
-    --arg p "$prompt" \
-    --argjson think "$think" \
-    --argjson search "$search" \
-    '{
-      chat_session_id: $sid,
-      parent_message_id: null,
-      prompt: $p,
-      ref_file_ids: [],
-      thinking_enabled: $think,
-      search_enabled: $search
-    }')"
+  payload="$("$DS_PYTHON" - "$session_id" "$prompt" "$think" "$search" <<'PY'
+import json, sys
+sid, prompt, think, search = sys.argv[1:5]
+print(json.dumps({
+    "chat_session_id": sid,
+    "parent_message_id": None,
+    "prompt": prompt,
+    "ref_file_ids": [],
+    "thinking_enabled": think == "true",
+    "search_enabled": search == "true",
+}, ensure_ascii=False))
+PY
+)"
 
   _ds_stream_request "$payload"
 }

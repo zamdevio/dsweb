@@ -46,10 +46,12 @@ ds_http() {
   printf '%s' "$DS_LAST_BODY"
 }
 
-# Parse a field out of JSON on stdin using jq, empty-safe.
-ds_jq() { jq -r "${1:-.}" 2>/dev/null; }
+# Parse a field out of JSON on stdin (jq if present, else python).
+ds_jq() { ds_json_query "${1:-.}"; }
 
-ds_urlencode() { jq -rn --arg v "$1" '$v|@uri'; }
+ds_urlencode() {
+  "$DS_PYTHON" -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
 
 # Warm the upstream session (primes WAF cookies into the shared jar).
 ds_http_warm() {
@@ -57,18 +59,22 @@ ds_http_warm() {
 }
 
 # ds_pow_solve <target_path> -> prints x-ds-pow-response value.
-# Fetches a challenge (needs auth) then solves it with the wasm.
 ds_pow_solve() {
   local target="$1"
   local resp code
   resp="$(ds_http POST "/chat/create_pow_challenge" \
-    "$(jq -n --arg t "$target" '{target_path:$t}')")" || return 1
+    "$(ds_json_build "target_path=$target")")" || return 1
   code="$(ds_http_code)"
   [[ "$code" == "200" ]] || { log_debug "pow challenge HTTP $code"; return 1; }
 
   local challenge
-  challenge="$(printf '%s' "$resp" | jq -c '.data.biz_data.challenge')"
-  [[ "$challenge" == "null" || -z "$challenge" ]] && return 1
+  challenge="$(printf '%s' "$resp" | "$DS_PYTHON" -c '
+import json,sys
+d=json.load(sys.stdin)
+ch=((d.get("data") or {}).get("biz_data") or {}).get("challenge")
+if not ch: sys.exit(1)
+json.dump(ch, sys.stdout)
+')" || return 1
 
   printf '%s' "$challenge" | "$DS_PYTHON" "$DS_ROOT/lib/pow.py"
 }

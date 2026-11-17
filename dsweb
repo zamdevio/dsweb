@@ -27,9 +27,9 @@ usage() {
   ds_help_line "logout" "remove saved auth"
 
   ds_help_h "CHAT"
-  ds_help_line "ask \"…\"" "one-shot completion"
-  ds_help_line "chat" "interactive REPL"
-  ds_help_line "-s, --session <id>" "reuse a session"
+  ds_help_line "ask \"…\"" "one-shot (temp session, deleted after)"
+  ds_help_line "chat" "interactive REPL (temp until exit)"
+  ds_help_line "-s, --session <id>" "sticky session (skip temp delete)"
   ds_help_line "--think / --search" "enable thinking / web search"
   ds_help_line "--model <m>" "deepseek-chat | deepseek-reasoner"
 
@@ -46,6 +46,7 @@ usage() {
   ds_help_line "setup" "idempotent bootstrap"
   ds_help_line "selftest" "offline checks"
   ds_help_line "doctor" "deps / auth / paths"
+  ds_help_line "config" "show/get/set ~/.config/dsweb/config.json"
 
   ds_help_h "FLAGS"
   ds_help_line "--no-color" "plain output (or DS_COLOR=never)"
@@ -55,10 +56,14 @@ usage() {
   printf '  %s\n' \
     "./scripts/setup.sh" \
     "./dsweb token" \
+    "./dsweb config set DS_API_KEY sk-…" \
     "./dsweb whoami" \
     "./dsweb ask \"hi\" --think" \
     "./dsweb serve" \
     "./dsweb cloudflared"
+  printf '\n'
+  printf '%sSecrets → auth.json · settings → config.json · process env wins.%s\n' \
+    "$_S_DIM" "$_S_RST"
   printf '\n'
 }
 
@@ -88,26 +93,126 @@ cmd_token() {
 }
 
 cmd_ask() {
-  local prompt="$1" sid="${DS_SESSION_ID:-}"
+  local prompt="$1" sid="${DS_SESSION_ID:-}" temp=0
   need_auth
-  [[ -z "$sid" ]] && sid="$(ds_session_new)"
-  ds_chat_stream "$sid" "$prompt" || die "request failed"
+  # Default temp (unless -s or DS_SAVE_CHATS) — no sidebar spam.
+  if [[ -z "$sid" ]]; then
+    sid="$(ds_session_new)"
+    ds_temp_sessions && temp=1
+  fi
+  ds_chat_stream "$sid" "$prompt" || {
+    [[ $temp -eq 1 ]] && ds_session_delete "$sid" --quiet
+    die "request failed"
+  }
+  [[ $temp -eq 1 ]] && ds_session_delete "$sid" --quiet
 }
 
 cmd_chat() {
   need_auth
-  local sid="${DS_SESSION_ID:-}"
-  [[ -z "$sid" ]] && sid="$(ds_session_new)"
-  log_ok "interactive session $sid (Ctrl-D to quit)"
+  local sid="${DS_SESSION_ID:-}" temp=0
+  if [[ -z "$sid" ]]; then
+    sid="$(ds_session_new)"
+    ds_temp_sessions && temp=1
+  fi
+  log_ok "interactive session $sid (Ctrl-D to quit$([[ $temp -eq 1 ]] && echo '; temp — deleted on exit'))"
   while printf 'you> ' && IFS= read -r line; do
     [[ -z "$line" ]] && continue
     printf 'ai>  '
     ds_chat_stream "$sid" "$line" || log_warn "request failed"
   done
+  [[ $temp -eq 1 ]] && ds_session_delete "$sid" --quiet
 }
 
 cmd_setup() {
   exec "$DS_ROOT/scripts/setup.sh"
+}
+
+cmd_config() {
+  ds_ensure_config_file
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    show|list|"")
+      printf '\n' >&2
+      printf '  %s%s%s\n' "$_S_MINT$_S_BOLD" "config" "$_S_RST" >&2
+      ds_hr 46 2
+      log_kv "file" "$DS_CONFIG_FILE"
+      log_kv "auth" "$DS_AUTH_FILE"
+      log_kv "proxy" "http://$DS_HOST:$DS_PORT/v1"
+      log_kv "model" "$DS_MODEL"
+      log_kv "save"  "$DS_SAVE_CHATS"
+      local key_disp="$DS_API_KEY"
+      [[ ${#key_disp} -gt 8 ]] && key_disp="${key_disp:0:4}…${key_disp: -4}"
+      if ds_api_key_is_weak; then
+        log_kv "api_key" "$key_disp (weak — ok for localhost)"
+      else
+        log_kv "api_key" "$key_disp"
+      fi
+      ds_hr 46 2
+      printf '  %skeys%s\n' "$_S_TEAL$_S_BOLD" "$_S_RST" >&2
+      "$DS_PYTHON" - "$DS_CONFIG_FILE" <<'PY' >&2
+import json, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception as e:
+    print(f"  (unreadable: {e})")
+    sys.exit(0)
+if not isinstance(data, dict) or not data:
+    print("  (empty)")
+    sys.exit(0)
+width = max(len(k) for k in data)
+for k in sorted(data):
+    v = data[k]
+    if k == "DS_API_KEY" and isinstance(v, str) and len(v) > 8:
+        v = f"{v[:4]}…{v[-4:]}"
+    print(f"  {k:<{width}}  {v}")
+PY
+      ds_hr 46 2
+      printf '  %s%s%s\n' "$_S_DIM" "env > config.json > defaults · secrets → auth.json" "$_S_RST" >&2
+      printf '  %s%s%s\n\n' "$_S_DIM" "config set KEY VAL · config get KEY · config edit · config path" "$_S_RST" >&2
+      ;;
+    path)
+      printf '%s\n' "$DS_CONFIG_FILE"
+      ;;
+    get)
+      local key="${1:-}"
+      [[ -n "$key" ]] || die "usage: config get DS_PORT"
+      DS_CFG_KEY="$key" "$DS_PYTHON" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["DS_ROOT"] + "/lib")
+from xdg_config import get
+print(get(os.environ["DS_CFG_KEY"], "") or "")
+PY
+      ;;
+    set)
+      [[ $# -ge 2 ]] || die "usage: config set DS_API_KEY sk-…"
+      local key="$1" val="$2"
+      DS_CFG_KEY="$key" DS_CFG_VAL="$val" "$DS_PYTHON" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["DS_ROOT"] + "/lib")
+from xdg_config import set_key
+set_key(os.environ["DS_CFG_KEY"], os.environ["DS_CFG_VAL"])
+PY
+      log_ok "set $key → $DS_CONFIG_FILE (restart serve if running)"
+      ;;
+    unset)
+      local key="${1:-}"
+      [[ -n "$key" ]] || die "usage: config unset DS_SYSTEM_PROMPT"
+      DS_CFG_KEY="$key" "$DS_PYTHON" - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["DS_ROOT"] + "/lib")
+from xdg_config import unset_key
+unset_key(os.environ["DS_CFG_KEY"])
+PY
+      log_ok "unset $key"
+      ;;
+    edit)
+      "${EDITOR:-vi}" "$DS_CONFIG_FILE"
+      ;;
+    *)
+      die "usage: config [show|path|get KEY|set KEY VAL|unset KEY|edit]"
+      ;;
+  esac
 }
 
 cmd_doctor() {
@@ -116,17 +221,28 @@ cmd_doctor() {
   say_bad() { log_err "$*"; failures=$((failures + 1)); }
   say_warn() { log_warn "$*"; }
 
+  ds_ensure_config_file
   log_info "dsweb doctor"
-  echo "  root:    $DS_ROOT"
-  echo "  config:  $DS_CONFIG_DIR"
-  echo "  data:    $DS_DATA_DIR"
-  echo "  auth:    $DS_AUTH_FILE"
-  echo "  python:  $DS_PYTHON"
-  echo "  upstream:$DS_BASE_URL"
-  echo "  proxy:   http://$DS_HOST:$DS_PORT"
+  echo "  root:      $DS_ROOT"
+  echo "  config dir:$DS_CONFIG_DIR"
+  echo "  config.json:$DS_CONFIG_FILE"
+  echo "  auth.json: $DS_AUTH_FILE"
+  echo "  data:      $DS_DATA_DIR"
+  echo "  python:    $DS_PYTHON"
+  echo "  upstream:  $DS_BASE_URL"
+  echo "  proxy:     http://$DS_HOST:$DS_PORT"
   echo
 
-  [[ -f "$DS_ROOT/.env" ]] && say_ok ".env present" || say_warn ".env missing (cp .env.example .env)"
+  [[ -f "$DS_CONFIG_FILE" ]] && say_ok "config.json present" || say_warn "config.json missing"
+  if [[ -f "$DS_ROOT/.env" ]]; then
+    if grep -qE '^DS_TOKEN=.+' "$DS_ROOT/.env" 2>/dev/null; then
+      say_warn ".env still has DS_TOKEN — secrets belong in auth.json (./dsweb setup migrates)"
+    else
+      say_ok ".env present (legacy settings only; prefer ./dsweb config)"
+    fi
+  else
+    say_ok "no .env (good — XDG config is enough)"
+  fi
 
   if [[ -x "$DS_ROOT/.venv/bin/python" ]]; then say_ok "venv present"
   else say_bad "venv missing — run: ./dsweb setup"; fi
@@ -143,7 +259,8 @@ cmd_doctor() {
     say_bad "client package import failed"
   fi
 
-  command -v jq >/dev/null && say_ok "jq present" || say_bad "jq missing"
+  if command -v jq >/dev/null; then say_ok "jq present (optional)"
+  else say_ok "jq missing — using python JSON fallback"; fi
   command -v curl >/dev/null && say_ok "curl present" || say_bad "curl missing"
   [[ -f "$DS_WASM" ]] && say_ok "pow wasm present" || say_bad "pow wasm missing at $DS_WASM"
 
@@ -155,7 +272,8 @@ cmd_doctor() {
 
   if [[ -n "${DS_TOKEN:-}" || -f "$DS_AUTH_FILE" ]]; then
     say_ok "auth credential present"
-    if ds_auth_load 2>/dev/null && ds_auth_verify; then
+    if [[ -z "${DS_TOKEN:-}" ]]; then ds_auth_load 2>/dev/null || true; fi
+    if ds_auth_verify; then
       say_ok "auth valid (whoami reachable)"
     else
       say_bad "auth present but invalid — ./dsweb token"
@@ -241,7 +359,7 @@ cmd_cloudflared() {
     esac
   done
   if ds_api_key_is_weak; then
-    die "refusing cloudflared: set a strong DS_API_KEY in .env (public tunnel would be open)"
+    die "refusing cloudflared: set a strong DS_API_KEY (./dsweb config set DS_API_KEY sk-…)"
   fi
   if ! command -v cloudflared >/dev/null; then
     if ds_bool "${DS_CLOUDFLARED_AUTOINSTALL:-true}"; then
@@ -340,6 +458,10 @@ ds_parse_globals() {
 
 main() {
   ds_ensure_dirs
+  ds_ensure_config_file
+  if [[ "${DS_ENV_SECRET_WARN:-}" == "1" ]]; then
+    log_warn ".env had secrets — ignored. Use ./dsweb token (auth.json) only"
+  fi
   local -a DS_ARGV=()
   ds_parse_globals "$@"
   set -- "${DS_ARGV[@]}"
@@ -367,6 +489,7 @@ main() {
     url)      cmd_url ;;
     setup)    cmd_setup ;;
     doctor)   cmd_doctor ;;
+    config)   cmd_config "$@" ;;
     selftest) exec "$DS_ROOT/scripts/selftest.sh" ;;
     ""|help)  usage ;;
     *) log_err "unknown command: $cmd"; usage; exit 2 ;;

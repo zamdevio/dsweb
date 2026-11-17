@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# core/auth.sh - auth handling for the unofficial chat.deepseek.com API.
+# core/auth.sh - auth for unofficial chat.deepseek.com API.
 #
-# Two ways to authenticate, both stored in $DS_AUTH_FILE (0600):
-#   1. Paste browser cookies (userToken / ds_session_id)  -> ds_auth_from_cookie
-#   2. Email + password login                              -> ds_auth_login
-#
-# The resulting bearer token lands in $DS_TOKEN.
+# Secrets live ONLY in $DS_AUTH_FILE (~/.config/dsweb/auth.json).
+# Process env DS_TOKEN/DS_COOKIE may override for CI. Never from .env.
 
 # --- storage -----------------------------------------------------------------
 
 ds_auth_load() {
   [[ -f "$DS_AUTH_FILE" ]] || return 1
-  DS_TOKEN="$(jq -r '.token // empty' "$DS_AUTH_FILE" 2>/dev/null)"
-  DS_COOKIE="$(jq -r '.cookie // empty' "$DS_AUTH_FILE" 2>/dev/null)"
-  DS_EMAIL="$(jq -r '.email // empty' "$DS_AUTH_FILE" 2>/dev/null)"
+  DS_TOKEN="$(ds_json_get_file "$DS_AUTH_FILE" '.token //empty')"
+  DS_COOKIE="$(ds_json_get_file "$DS_AUTH_FILE" '.cookie //empty')"
+  DS_EMAIL="$(ds_json_get_file "$DS_AUTH_FILE" '.email //empty')"
   [[ -n "$DS_TOKEN" || -n "$DS_COOKIE" ]] || return 1
   export DS_TOKEN DS_COOKIE DS_EMAIL
 }
@@ -21,81 +18,59 @@ ds_auth_load() {
 ds_auth_save() {
   local token="$1" cookie="${2:-}" email="${3:-}"
   ds_ensure_dirs
-  jq -n --arg t "$token" --arg c "$cookie" --arg e "$email" \
-    --arg ts "$(date -u +%FT%TZ)" \
-    '{token:$t, cookie:$c, email:$e, saved_at:$ts}' > "$DS_AUTH_FILE"
-  chmod 600 "$DS_AUTH_FILE"
+  local ts
+  ts="$(date -u +%FT%TZ)"
+  printf '%s\n' "$(ds_json_build \
+    "token=$token" "cookie=$cookie" "email=$email" "saved_at=$ts")" \
+    | ds_json_write_file "$DS_AUTH_FILE" 600
   log_ok "Auth saved to $DS_AUTH_FILE"
 }
 
 ds_auth_logout() {
   rm -f "$DS_AUTH_FILE"
+  unset DS_TOKEN DS_COOKIE
   log_ok "Logged out (removed $DS_AUTH_FILE)"
 }
 
-# Store a bare bearer token (from localStorage / devtools).
 ds_auth_set_token() {
   local tok="$1"
   tok="$(printf '%s' "$tok" | tr -d '\r\n' | sed -E 's/^Bearer[[:space:]]+//')"
   [[ -n "$tok" ]] || die "empty token"
-  # unwrap DeepSeek localStorage form {"value":"...","__version":"0"}
   case "$tok" in
     \{*\})
       local v
-      v="$(printf '%s' "$tok" | jq -r '.value // empty' 2>/dev/null)"
+      v="$(printf '%s' "$tok" | ds_json_query '.value //empty')"
       [[ -n "$v" ]] && tok="$v" ;;
   esac
   DS_TOKEN="$tok"; export DS_TOKEN
   ds_auth_save "$tok" "${DS_COOKIE:-}" "${DS_EMAIL:-}"
 }
 
-# --- extract token out of a raw cookie string / header blob -------------------
-
-# Accepts: full "a=b; c=d" cookie strings, or the value of userToken alone.
 ds_extract_token_from_cookie() {
   local raw="$1" tok=""
-
-  # userToken=<jwt-ish>  (may be percent-encoded)
   tok="$(printf '%s' "$raw" | grep -oE '(^|[;[:space:]])userToken=[^;[:space:]]+' \
         | head -1 | sed -E 's/.*userToken=//')"
   [[ -z "$tok" ]] && tok="$(printf '%s' "$raw" | grep -oE '"(userToken|token)"[[:space:]]*:[[:space:]]*"[^"]+"' \
         | head -1 | sed -E 's/.*"([^"]+)"$/\1/')"
-
-  # percent-decode if it looks encoded
   case "$tok" in
     *%*) tok="$(printf '%b' "${tok//%/\\x}")" ;;
   esac
   printf '%s' "$tok"
 }
 
-# --- method 1: pasted cookies -----------------------------------------------
-
-# ds_auth_from_cookie '<cookie string>'  OR pipe via stdin, OR use -w to read
-# from an open browser (best effort).
 ds_auth_from_cookie() {
   local raw="${1:-}"
   [[ -z "$raw" ]] && raw="$(cat)"
-
   [[ -n "$raw" ]] || die "no cookie provided (pass as arg, pipe, or use --from-browser)"
 
   local token
   token="$(ds_extract_token_from_cookie "$raw")"
-  [[ -n "$token" ]] || die "could not find userToken in the pasted cookies"
+  [[ -n "$token" ]] || die "could not find userToken in cookie string"
 
   DS_COOKIE="$raw"
   DS_TOKEN="$token"
   export DS_COOKIE DS_TOKEN
-
   ds_auth_save "$token" "$raw" "${DS_EMAIL:-}"
-}
-
-# --- method 2: email + password ---------------------------------------------
-
-# DeepSeek's web /login body (captured from bundle): password is sent raw.
-#   {email, mobile:"", area_code:"", password, device_id, os}
-ds_hash_password() {
-  # kept for compatibility; DeepSeek currently expects the raw password
-  printf '%s' "$1"
 }
 
 ds_auth_login() {
@@ -106,11 +81,8 @@ ds_auth_login() {
   DS_TOKEN=""  # unauth call
   local device_id body resp code
   device_id="deepseek-web-cli-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  body="$(jq -n \
-    --arg e "$email" \
-    --arg p "$password" \
-    --arg d "$device_id" \
-    '{email:$e, mobile:"", area_code:"", password:$p, device_id:$d, os:"web"}')"
+  body="$(ds_json_build "email=$email" "mobile=" "area_code=" "password=$password" "device_id=$device_id" "os=web")"
+  # login body needs empty strings — ds_json_build is fine
 
   resp="$(ds_http POST "/users/login" "$body")"
   code="$(ds_http_code)"
@@ -121,16 +93,14 @@ ds_auth_login() {
     return 1
   fi
   if [[ "$code" != "200" ]]; then
-    log_err "login failed (HTTP $code): $(printf '%s' "$resp" | jq -c . 2>/dev/null || printf '%s' "$resp")"
+    log_err "login failed (HTTP $code): $(printf '%s' "$resp" | ds_json_query '.' 2>/dev/null || printf '%s' "$resp")"
     return 1
   fi
 
-  # success shape: {code:0, data:{biz_code:0, biz_data:{user:{token,id}}}}
   local bizcode token
-  bizcode="$(printf '%s' "$resp" | jq -r '.data.biz_code // empty')"
-  token="$(printf '%s' "$resp" | jq -r '
-    .data.biz_data.user.token // .data.biz_data.token
-    // .data.user.token // .data.token // empty')"
+  bizcode="$(printf '%s' "$resp" | ds_json_query '.data.biz_code //empty')"
+  token="$(printf '%s' "$resp" | ds_json_query '.data.biz_data.user.token //empty')"
+  [[ -z "$token" ]] && token="$(printf '%s' "$resp" | ds_json_query '.data.biz_data.token //empty')"
 
   if [[ -z "$token" ]]; then
     if [[ -n "$bizcode" && "$bizcode" != "0" ]]; then
@@ -147,23 +117,25 @@ ds_auth_login() {
   ds_auth_save "$token" "" "$email"
 }
 
-# --- verify / whoami ---------------------------------------------------------
-
 ds_auth_verify() {
-  # Quiet validity check (used by cookie/token save). Exit 0 if profile loads.
   local resp code
   resp="$(ds_http GET "/users/current")"
   code="$(ds_http_code)"
   [[ "$code" == "200" ]] || return 1
   local msg
-  msg="$(printf '%s' "$resp" | jq -r '.msg // empty' 2>/dev/null)"
-  [[ "$msg" != "Missing Token" && "$msg" != "INVALID_TOKEN" ]] || return 1
+  msg="$(printf '%s' "$resp" | ds_json_query '.msg //empty')"
+  case "$msg" in
+    Missing\ Token|INVALID_TOKEN|Authorization\ Failed*) return 1 ;;
+  esac
+  # also catch code 40003
+  local c
+  c="$(printf '%s' "$resp" | ds_json_query '.code //empty')"
+  [[ "$c" == "40003" ]] && return 1
   local biz
-  biz="$(printf '%s' "$resp" | jq -c '.data.biz_data // empty' 2>/dev/null)"
+  biz="$(printf '%s' "$resp" | ds_json_query '.data.biz_data //empty')"
   [[ -n "$biz" && "$biz" != "null" ]]
 }
 
-# Styled profile from /users/current (no raw JSON dump).
 ds_auth_whoami() {
   local resp code
   resp="$(ds_http GET "/users/current")"
@@ -172,65 +144,69 @@ ds_auth_whoami() {
     log_err "whoami failed (HTTP ${code:-?})"
     return 1
   fi
-  local msg
-  msg="$(printf '%s' "$resp" | jq -r '.msg // empty' 2>/dev/null)"
-  if [[ "$msg" == "Missing Token" || "$msg" == "INVALID_TOKEN" ]]; then
-    log_err "auth invalid: $msg"
+  local msg c
+  msg="$(printf '%s' "$resp" | ds_json_query '.msg //empty')"
+  c="$(printf '%s' "$resp" | ds_json_query '.code //empty')"
+  if [[ "$c" == "40003" || "$msg" == "Missing Token" || "$msg" == "INVALID_TOKEN" || "$msg" == Authorization\ Failed* ]]; then
+    log_err "auth invalid: ${msg:-code $c}"
+    log_info "fix: ./dsweb token   (paste fresh userToken)"
     return 1
   fi
 
-  local biz
-  biz="$(printf '%s' "$resp" | jq -c '.data.biz_data // empty' 2>/dev/null)"
-  if [[ -z "$biz" || "$biz" == "null" ]]; then
-    log_err "whoami: empty profile"
-    return 1
-  fi
+  local lines
+  # Pass JSON via env — a heredoc would steal stdin from a pipe.
+  lines="$(DS_WHOAMI_JSON="$resp" "$DS_PYTHON" -c '
+import json, os, sys
+data = json.loads(os.environ.get("DS_WHOAMI_JSON") or "")
+biz = ((data.get("data") or {}).get("biz_data")) or {}
+if not biz:
+    sys.exit(1)
 
-  local id email mobile status muted mainland minor token_fp
-  id="$(printf '%s' "$biz" | jq -r '.id // "-"')"
-  email="$(printf '%s' "$biz" | jq -r '
-    .email // empty
-    | if . == "" then "-"
-      else (split("@") | "\(.[0][0:2])****@\(.[1])") end')"
-  mobile="$(printf '%s' "$biz" | jq -r '
-    .mobile_number // empty | if . == "" then "-" else . end')"
-  status="$(printf '%s' "$biz" | jq -r '.status // 0')"
-  muted="$(printf '%s' "$biz" | jq -r '.chat.is_muted // 0')"
-  mainland="$(printf '%s' "$biz" | jq -r '.is_mainland // false')"
-  minor="$(printf '%s' "$biz" | jq -r '.minor_mode_status // "NONE"')"
-  token_fp="$(printf '%s' "$biz" | jq -r '
-    .token // empty
-    | if . == "" then "-"
-      else "\(.[0:8])… (\(length) chars)" end')"
+def mask_email(e):
+    if not e or "@" not in e:
+        return "-"
+    u, d = e.split("@", 1)
+    return f"{u[:2]}****@{d}"
 
-  local status_label="ok"
-  [[ "$status" != "0" ]] && status_label="status=$status"
+email = mask_email(biz.get("email") or "")
+tok = biz.get("token") or ""
+tok_fp = f"{tok[:8]}… ({len(tok)} chars)" if tok else "-"
+status = biz.get("status", 0)
+status_label = "ok" if status == 0 else f"status={status}"
+chat = biz.get("chat") or {}
+rows = [
+    ("email", email),
+    ("id", str(biz.get("id") or "-")),
+    ("token", tok_fp),
+    ("mobile", str(biz.get("mobile_number") or "-")),
+    ("account", status_label),
+    ("muted", str(chat.get("is_muted", 0))),
+    ("mainland", str(biz.get("is_mainland", False))),
+    ("minor", str(biz.get("minor_mode_status") or "NONE")),
+]
+for k, v in rows:
+    print(f"{k}\t{v}")
+')" || { log_err "whoami: empty profile / auth invalid"; return 1; }
 
   printf '\n' >&2
   printf '  %s%s%s\n' "$_S_MINT$_S_BOLD" "whoami" "$_S_RST" >&2
   ds_hr 46 2
-  log_kv "email"    "$email"
-  log_kv "id"       "$id"
-  log_kv "token"    "$token_fp"
-  log_kv "mobile"   "$mobile"
-  log_kv "account"  "$status_label"
-  log_kv "muted"    "$muted"
-  log_kv "mainland" "$mainland"
-  log_kv "minor"    "$minor"
+  while IFS=$'\t' read -r k v; do
+    [[ -n "$k" ]] && log_kv "$k" "$v"
+  done <<< "$lines"
   ds_hr 46 2
   printf '\n' >&2
 }
 
-# Only re-auth when needed. Prefers an existing .env token/cookie.
+# Auth resolve order: process env → auth.json. Never .env.
 ds_auth_ensure() {
-  # .env-provided creds (config already loaded them) win if present
   if [[ -n "${DS_TOKEN:-}" || -n "${DS_COOKIE:-}" ]]; then
-    log_debug "using .env credentials"
+    log_debug "using process-env credentials"
     return 0
   fi
   if ds_auth_load; then
-    log_debug "using cached token"
+    log_debug "using auth.json"
     return 0
   fi
-  die "not authenticated. Run: ./dsweb token   (or cookie/login)"
+  die "not authenticated. Run: ./dsweb token   (secrets live in $DS_AUTH_FILE)"
 }

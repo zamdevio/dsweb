@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # scripts/setup.sh — idempotent bootstrap for a fresh machine / clone.
-# Skips work that's already done. Safe to re-run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,7 +10,6 @@ source "$ROOT/lib/config.sh"
 # shellcheck source=../lib/log.sh
 source "$ROOT/lib/log.sh"
 
-NEED_PY=()
 SKIPPED=0
 DID=0
 
@@ -30,27 +28,108 @@ else
   step_fail "python3 missing — install Python 3.10+"
 fi
 
-if have_cmd jq; then step_ok "jq"
-else NEED_PY+=("jq"); log_warn "jq missing (needed for CLI JSON)"; fi
-
 if have_cmd curl; then step_ok "curl"
 else step_fail "curl missing"; fi
 
-# ── .env ──────────────────────────────────────────────────────
-if [[ -f "$ROOT/.env" ]]; then
-  step_skip ".env already present"
+# jq is optional — auth/CLI fall back to python. Offer install if missing.
+if have_cmd jq; then
+  step_ok "jq"
 else
-  if [[ -f "$ROOT/.env.example" ]]; then
-    cp "$ROOT/.env.example" "$ROOT/.env"
-    step_ok "wrote .env from .env.example — edit DS_TOKEN / DS_API_KEY"
-  else
-    step_fail ".env.example missing"
+  log_warn "jq missing (optional — python JSON fallback is used)"
+  install_jq=n
+  if [[ -t 0 ]]; then
+    printf 'Install jq now? [y/N] ' >&2
+    read -r install_jq || true
+  elif [[ "${DS_SETUP_INSTALL_JQ:-}" == "1" ]]; then
+    install_jq=y
   fi
+  case "$(printf '%s' "$install_jq" | tr '[:upper:]' '[:lower:]')" in
+    y|yes)
+      if have_cmd apt-get && [[ "$(id -u)" -eq 0 ]]; then
+        apt-get install -y jq && step_ok "jq installed (apt)"
+      elif have_cmd apt-get; then
+        if sudo -n true 2>/dev/null; then
+          sudo apt-get install -y jq && step_ok "jq installed (apt/sudo)"
+        else
+          log_warn "run: sudo apt-get install -y jq"
+        fi
+      elif have_cmd brew; then
+        brew install jq && step_ok "jq installed (brew)"
+      elif have_cmd dnf; then
+        sudo dnf install -y jq && step_ok "jq installed (dnf)"
+      elif have_cmd pacman; then
+        sudo pacman -S --noconfirm jq && step_ok "jq installed (pacman)"
+      else
+        log_warn "no known package manager — install jq yourself, or ignore (python fallback works)"
+      fi
+      ;;
+    *)
+      step_skip "jq not installed (auth works without it)"
+      ;;
+  esac
 fi
 
-# ── XDG dirs ──────────────────────────────────────────────────
+# ── XDG dirs + config.json ────────────────────────────────────
 ds_ensure_dirs
-step_ok "XDG dirs config=$DS_CONFIG_DIR data=$DS_DATA_DIR"
+ds_ensure_config_file
+step_ok "XDG config=$DS_CONFIG_DIR data=$DS_DATA_DIR"
+step_ok "config.json → $DS_CONFIG_FILE"
+
+# Migrate leftover .env secrets → auth.json, settings → config.json
+if [[ -f "$ROOT/.env" ]]; then
+  if grep -qE '^DS_TOKEN=.+' "$ROOT/.env" 2>/dev/null; then
+    log_info "migrating DS_TOKEN from .env → auth.json"
+    tok="$(grep -E '^DS_TOKEN=' "$ROOT/.env" | head -1 | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
+    if [[ -n "$tok" ]]; then
+      existing="$(ds_json_get_file "$DS_AUTH_FILE" '.token //empty' 2>/dev/null || true)"
+      if [[ -z "$existing" ]]; then
+        ts="$(date -u +%FT%TZ)"
+        printf '%s\n' "$(ds_json_build "token=$tok" "cookie=" "email=" "saved_at=$ts")" \
+          | ds_json_write_file "$DS_AUTH_FILE" 600
+        step_ok "token → $DS_AUTH_FILE"
+      fi
+    fi
+  fi
+  # Non-secret DS_* still in .env → config.json (don't clobber existing keys)
+  "$DS_PYTHON" - "$ROOT/.env" "$DS_CONFIG_FILE" <<'PY' && step_ok "settings synced .env → config.json" || true
+import json, sys
+from pathlib import Path
+env_path, cfg_path = Path(sys.argv[1]), Path(sys.argv[2])
+secrets = {"DS_TOKEN", "DS_COOKIE", "DS_PASSWORD", "DS_EMAIL"}
+cfg = {}
+if cfg_path.is_file():
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+changed = False
+for line in env_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    k, v = line.split("=", 1)
+    k, v = k.strip(), v.strip().strip("\"'")
+    if not k.startswith("DS_") or k in secrets or not v:
+        continue
+    if k not in cfg or cfg.get(k) in (None, "", "sk-dsweb-change-me"):
+        if cfg.get(k) != v:
+            cfg[k] = v
+            changed = True
+if changed:
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+PY
+  sed -i -E \
+    -e 's/^(DS_TOKEN|DS_COOKIE|DS_PASSWORD)=/# moved to auth.json — \1=/' \
+    -e 's/^(DS_API_KEY|DS_HOST|DS_PORT|DS_MODEL|DS_SAVE_CHATS)=/# moved to config.json — \1=/' \
+    "$ROOT/.env" 2>/dev/null || true
+fi
+
+# .env is optional legacy — we no longer require it
+if [[ -f "$ROOT/.env" ]]; then
+  step_skip ".env present (legacy settings only; prefer: ./dsweb config)"
+else
+  step_skip ".env not required — use ./dsweb config / auth.json"
+fi
 
 # ── venv ──────────────────────────────────────────────────────
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
@@ -76,7 +155,6 @@ elif [[ "$REQ_HASH" != "$PREV_HASH" ]]; then
   need_install=1
   log_info "requirements.txt changed — reinstalling"
 else
-  # verify imports even if stamp matches
   if ! "$PY" -c 'import curl_cffi, wasmtime, fastapi, uvicorn' 2>/dev/null; then
     need_install=1
     log_warn "stamp ok but imports failed — reinstalling"
@@ -93,29 +171,26 @@ else
   step_ok "python deps installed"
 fi
 
-# ── wasm present ──────────────────────────────────────────────
 if [[ -f "$DS_WASM" ]]; then
   step_ok "pow wasm present"
 else
   log_warn "pow wasm missing at $DS_WASM (PoW will fail)"
 fi
 
-# ── optional: cloudflared hint ────────────────────────────────
 if have_cmd cloudflared; then
   step_ok "cloudflared on PATH"
 else
-  step_skip "cloudflared not installed (optional; ./dsweb cloudflared can auto-install)"
+  step_skip "cloudflared not installed (optional)"
 fi
 
-# ── auth hint ─────────────────────────────────────────────────
 if [[ -f "$DS_AUTH_FILE" ]] || [[ -n "${DS_TOKEN:-}" ]]; then
-  step_ok "auth credential present (file or DS_TOKEN)"
+  step_ok "auth credential present (auth.json or DS_TOKEN env)"
 else
-  log_warn "no auth yet — next: ./dsweb token <userToken from chat.deepseek.com localStorage>"
+  log_warn "no auth yet — next: ./dsweb token <userToken from chat.deepseek.com>"
 fi
 
 echo
 log_ok "setup done (did=$DID skipped=$SKIPPED)"
-log_info "next:  ./dsweb doctor"
-log_info "auth:  ./dsweb token   # paste userToken"
-log_info "try:   ./dsweb whoami && ./dsweb ask 'hi'"
+log_info "config: ./dsweb config          # ~/.config/dsweb/config.json"
+log_info "auth:   ./dsweb token           # → ~/.config/dsweb/auth.json"
+log_info "next:   ./dsweb doctor && ./dsweb whoami && ./dsweb serve"

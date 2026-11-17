@@ -36,20 +36,20 @@ should use `api.deepseek.com` instead.
 
 ## Quick start
 
-Requires **Python ≥ 3.10**, `curl`, `jq`.
+Requires **Python ≥ 3.10** and `curl`. `jq` is optional (Python JSON fallback).
 
 ```bash
 git clone <repo-url> dsweb && cd dsweb
-./scripts/setup.sh          # venv + deps + .env (skips what's done)
-$EDITOR .env                # set DS_API_KEY; token can wait
-./dsweb token               # paste userToken from chat.deepseek.com Local Storage
+./scripts/setup.sh          # venv + deps + ~/.config/dsweb/config.json
+./dsweb token               # paste userToken → ~/.config/dsweb/auth.json
+./dsweb config set DS_API_KEY sk-your-local-key
 ./dsweb doctor              # must be green
 ./dsweb whoami
 ./dsweb ask "hi" --think
 ./dsweb serve               # http://127.0.0.1:8787/v1
 ```
 
-Auth cannot be skipped — see [docs/auth.md](./docs/auth.md).
+Secrets → `auth.json`. Settings → `config.json`. See [docs/auth.md](./docs/auth.md).
 
 ## Layout
 
@@ -65,8 +65,8 @@ docs/                 human + agent docs
 maintainer/           phases/focus.md
 ```
 
-XDG defaults: `~/.config/dsweb/` (auth) · `~/.local/share/dsweb/` (data).  
-All overridable via `.env` — see [`.env.example`](./.env.example).
+XDG: `~/.config/dsweb/{auth,config}.json` · `~/.local/share/dsweb/` (data).  
+Process env overrides config. Repo `.env` is legacy (settings only — no secrets).
 
 ## Proxy + tools
 
